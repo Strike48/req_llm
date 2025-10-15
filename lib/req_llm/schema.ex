@@ -9,7 +9,7 @@ defmodule ReqLLM.Schema do
   ## Core Functions
 
   - `compile/1` - Convert keyword schema to NimbleOptions compiled schema
-  - `to_json/1` - Convert keyword schema to JSON Schema format  
+  - `to_json/1` - Convert keyword schema to JSON Schema format
 
 
   ## Basic Usage
@@ -22,7 +22,7 @@ defmodule ReqLLM.Schema do
 
       # Convert keyword schema to JSON Schema
       json_schema = ReqLLM.Schema.to_json([
-        name: [type: :string, required: true, doc: "User name"], 
+        name: [type: :string, required: true, doc: "User name"],
         age: [type: :pos_integer, doc: "User age"]
       ])
       # => %{
@@ -141,8 +141,8 @@ defmodule ReqLLM.Schema do
           "name" => %{"type" => "string", "description" => "User name"},
           "age" => %{"type" => "integer", "description" => "User age"},
           "tags" => %{
-            "type" => "array", 
-            "items" => %{"type" => "string"}, 
+            "type" => "array",
+            "items" => %{"type" => "string"},
             "description" => "User tags"
           }
         },
@@ -545,7 +545,7 @@ defmodule ReqLLM.Schema do
       iex> ReqLLM.Schema.validate(data, schema)
       {:ok, [name: "Alice", age: 30]}
 
-      iex> schema = [name: [type: :string, required: true]]  
+      iex> schema = [name: [type: :string, required: true]]
       iex> data = %{"age" => 30}
       iex> ReqLLM.Schema.validate(data, schema)
       {:error, %ReqLLM.Error.Validation.Error{...}}

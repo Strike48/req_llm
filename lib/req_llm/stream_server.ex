@@ -92,7 +92,8 @@ defmodule ReqLLM.StreamServer do
     object_acc: [],
     fixture_saved?: false,
     raw_iodata: [],
-    raw_bytes: 0
+    raw_bytes: 0,
+    error_body: ""
   ]
 
   @doc """
@@ -388,8 +389,25 @@ defmodule ReqLLM.StreamServer do
 
     new_state =
       case reason do
-        :normal -> finalize_stream_with_fixture(state)
-        _ -> %{state | status: {:error, {:http_task_failed, reason}}}
+        :normal ->
+          # Check if we have an error HTTP status and need to create error exception
+          cond do
+            # Already have error status set (from :done event)
+            match?({:error, _}, state.status) ->
+              state
+
+            # HTTP status indicates error - create error exception now
+            state.http_status && state.http_status >= 400 ->
+              error_exception = create_api_error(state.http_status, state.error_body)
+              %{state | status: {:error, error_exception}}
+
+            # Normal completion
+            true ->
+              finalize_stream_with_fixture(state)
+          end
+
+        _ ->
+          %{state | status: {:error, {:http_task_failed, reason}}}
       end
 
     new_state = reply_to_waiting_callers(new_state)
@@ -426,7 +444,8 @@ defmodule ReqLLM.StreamServer do
 
   defp process_http_event({:data, chunk}, state) do
     if state.http_status && state.http_status >= 400 do
-      error = build_http_error(state.http_status, chunk)
+      # Immediately create error when we receive data with error status
+      error = create_api_error(state.http_status, chunk)
       new_state = %{state | status: {:error, error}} |> reply_to_waiting_callers()
       {:reply, :ok, new_state}
     else
@@ -435,7 +454,19 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp process_http_event(:done, state) do
-    new_state = finalize_stream_with_fixture(state) |> reply_to_waiting_callers()
+    # Check if we have an error status code
+    new_state =
+      if state.http_status && state.http_status >= 400 do
+        # Parse error body and create API error exception (even if body is empty)
+        error_exception = create_api_error(state.http_status, state.error_body)
+
+        %{state | status: {:error, error_exception}}
+        |> reply_to_waiting_callers()
+      else
+        finalize_stream_with_fixture(state)
+        |> reply_to_waiting_callers()
+      end
+
     {:reply, :ok, new_state}
   end
 
@@ -538,9 +569,8 @@ defmodule ReqLLM.StreamServer do
       Enum.reduce(chunks, {state.queue, state.metadata, state.object_acc}, fn chunk,
                                                                               {queue, metadata,
                                                                                obj_acc} ->
-        new_queue = :queue.in(chunk, queue)
-
-        updated_metadata =
+        # Normalize usage in meta chunks before enqueuing
+        normalized_chunk =
           case chunk.type do
             :meta ->
               usage =
@@ -548,7 +578,26 @@ defmodule ReqLLM.StreamServer do
 
               if usage do
                 normalized_usage = normalize_streaming_usage(usage, state.model)
-                Map.update(metadata, :usage, normalized_usage, &Map.merge(&1, normalized_usage))
+                # Update the chunk with normalized usage
+                updated_metadata = Map.put(chunk.metadata, :usage, normalized_usage)
+                %{chunk | metadata: updated_metadata}
+              else
+                chunk
+              end
+
+            _ ->
+              chunk
+          end
+
+        new_queue = :queue.in(normalized_chunk, queue)
+
+        updated_metadata =
+          case normalized_chunk.type do
+            :meta ->
+              usage = Map.get(normalized_chunk.metadata || %{}, :usage)
+
+              if usage do
+                Map.update(metadata, :usage, usage, &Map.merge(&1, usage))
               else
                 metadata
               end
@@ -558,8 +607,9 @@ defmodule ReqLLM.StreamServer do
           end
 
         obj_acc =
-          if state.object_json_mode? and chunk.type == :content and is_binary(chunk.text) do
-            [obj_acc, chunk.text]
+          if state.object_json_mode? and normalized_chunk.type == :content and
+               is_binary(normalized_chunk.text) do
+            [obj_acc, normalized_chunk.text]
           else
             obj_acc
           end
@@ -758,33 +808,6 @@ defmodule ReqLLM.StreamServer do
     state
   end
 
-  defp build_http_error(status, chunk) do
-    case Jason.decode(chunk) do
-      {:ok, %{"error" => error_data}} when is_map(error_data) ->
-        message = Map.get(error_data, "message", "HTTP #{status}")
-
-        ReqLLM.Error.API.Request.exception(
-          reason: message,
-          status: status,
-          response_body: error_data
-        )
-
-      {:ok, decoded} ->
-        ReqLLM.Error.API.Request.exception(
-          reason: "HTTP #{status}",
-          status: status,
-          response_body: decoded
-        )
-
-      {:error, _} ->
-        ReqLLM.Error.API.Request.exception(
-          reason: "HTTP #{status}",
-          status: status,
-          response_body: chunk
-        )
-    end
-  end
-
   # Normalize streaming usage data from provider format to ReqLLM format
   # This mirrors the logic in ReqLLM.Step.Usage.fallback_extract_usage/1
   defp normalize_streaming_usage(usage, model) when is_map(usage) do
@@ -898,4 +921,56 @@ defmodule ReqLLM.StreamServer do
   end
 
   defp calculate_cost_if_model_available(usage, _), do: usage
+
+  # Create API error exception matching generate_text error format
+  defp create_api_error(status, error_body) when is_binary(error_body) do
+    # Try to parse JSON error body
+    {body, reason} =
+      case Jason.decode(error_body) do
+        {:ok, %{"error" => error_data}} when is_map(error_data) ->
+          # Extract message and use error_data as response_body
+          message = extract_error_message(%{"error" => error_data}, status)
+          {error_data, message}
+
+        {:ok, decoded} ->
+          # Use full decoded body
+          message = extract_error_message(decoded, status)
+          {decoded, message}
+
+        {:error, _} ->
+          # Non-JSON response
+          {error_body, "HTTP #{status}"}
+      end
+
+    ReqLLM.Error.API.Request.exception(
+      reason: reason,
+      status: status,
+      response_body: body
+    )
+  end
+
+  defp extract_error_message(body, status) when is_map(body) do
+    # Try common error message patterns
+    cond do
+      Map.has_key?(body, "error") && is_map(body["error"]) &&
+          Map.has_key?(body["error"], "message") ->
+        body["error"]["message"]
+
+      Map.has_key?(body, "error") && is_binary(body["error"]) ->
+        body["error"]
+
+      Map.has_key?(body, "message") ->
+        body["message"]
+
+      Map.has_key?(body, "detail") ->
+        body["detail"]
+
+      true ->
+        "HTTP #{status}"
+    end
+  end
+
+  defp extract_error_message(_body, status) do
+    "HTTP #{status}"
+  end
 end

@@ -746,6 +746,392 @@ defmodule ReqLLM.Providers.GoogleTest do
     end
   end
 
+  describe "tool result encoding (agentic loops)" do
+    test "encode_body with Context containing tool result messages" do
+      # Create a multi-turn conversation with tool calls and results
+      context =
+        Context.new([
+          Context.system("You are a helpful assistant"),
+          Context.user("What's the weather?"),
+          Context.assistant("Let me check.",
+            tool_calls: [
+              %{
+                id: "call_123",
+                name: "get_weather",
+                arguments: %{"location" => "SF"}
+              }
+            ]
+          ),
+          Context.tool_result_message("get_weather", "call_123", %{
+            "temperature" => 72,
+            "conditions" => "sunny"
+          })
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: "gemini-1.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      # Verify structure
+      assert Map.has_key?(decoded, "systemInstruction")
+      contents = decoded["contents"]
+      assert length(contents) == 3
+
+      # User message
+      assert Enum.at(contents, 0)["role"] == "user"
+      assert Enum.at(contents, 0)["parts"] == [%{"text" => "What's the weather?"}]
+
+      # Assistant message with tool call
+      assert Enum.at(contents, 1)["role"] == "model"
+      parts_1 = Enum.at(contents, 1)["parts"]
+      assert length(parts_1) == 2
+      assert Enum.at(parts_1, 0) == %{"text" => "Let me check."}
+
+      assert Enum.at(parts_1, 1) == %{
+               "functionCall" => %{
+                 "name" => "get_weather",
+                 "args" => %{"location" => "SF"}
+               }
+             }
+
+      # Tool result message (as user role with functionResponse)
+      assert Enum.at(contents, 2)["role"] == "user"
+      tool_result_parts = Enum.at(contents, 2)["parts"]
+      assert length(tool_result_parts) == 1
+
+      assert tool_result_parts == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "get_weather",
+                   "response" => %{
+                     "temperature" => 72,
+                     "conditions" => "sunny"
+                   }
+                 }
+               }
+             ]
+    end
+
+    test "encode_body handles multiple tool results in sequence" do
+      # Simulate a conversation with multiple tool calls
+      context =
+        Context.new([
+          Context.user("Check weather in SF and NYC"),
+          Context.assistant("",
+            tool_calls: [
+              %{id: "call_1", name: "get_weather", arguments: %{"location" => "SF"}},
+              %{id: "call_2", name: "get_weather", arguments: %{"location" => "NYC"}}
+            ]
+          ),
+          Context.tool_result_message("get_weather", "call_1", %{"temp" => 72}),
+          Context.tool_result_message("get_weather", "call_2", %{"temp" => 65})
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: "gemini-1.5-flash"
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      contents = decoded["contents"]
+      assert length(contents) == 4
+
+      # Assistant with two tool calls
+      model_msg = Enum.at(contents, 1)
+      assert model_msg["role"] == "model"
+      assert length(model_msg["parts"]) == 2
+
+      # Two separate tool result messages
+      tool_result_1 = Enum.at(contents, 2)
+      assert tool_result_1["role"] == "user"
+
+      assert tool_result_1["parts"] == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "get_weather",
+                   "response" => %{"temp" => 72}
+                 }
+               }
+             ]
+
+      tool_result_2 = Enum.at(contents, 3)
+      assert tool_result_2["role"] == "user"
+
+      assert tool_result_2["parts"] == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "get_weather",
+                   "response" => %{"temp" => 65}
+                 }
+               }
+             ]
+    end
+
+    test "encode_body with tool calls and results using Context API" do
+      # Create a conversation using proper Context API
+      context =
+        Context.new([
+          Context.user("Test"),
+          Context.assistant("Calling tool",
+            tool_calls: [
+              %{id: "tool_123", name: "test_tool", arguments: %{"param" => "value"}}
+            ]
+          ),
+          Context.tool_result_message("test_tool", "tool_123", %{"result" => "success"})
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: "gemini-1.5-flash"
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      contents = decoded["contents"]
+      assert length(contents) == 3
+
+      # Check tool result is properly formatted
+      tool_result_msg = Enum.at(contents, 2)
+      assert tool_result_msg["role"] == "user"
+
+      assert tool_result_msg["parts"] == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "test_tool",
+                   "response" => %{"result" => "success"}
+                 }
+               }
+             ]
+    end
+
+    test "encode_body preserves tool name from message.name field" do
+      # Create tool result message using Context API
+      context =
+        Context.new([
+          Context.tool_result_message("my_custom_tool", "call_xyz", %{"data" => "test"})
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: "gemini-1.5-flash"
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      [tool_msg] = decoded["contents"]
+
+      assert tool_msg["parts"] == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "my_custom_tool",
+                   "response" => %{"data" => "test"}
+                 }
+               }
+             ]
+    end
+
+    test "encode_body handles empty tool result" do
+      context =
+        Context.new([
+          Context.user("Test"),
+          Context.assistant("",
+            tool_calls: [
+              %{id: "call_1", name: "void_tool", arguments: %{}}
+            ]
+          ),
+          Context.tool_result_message("void_tool", "call_1", %{})
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: "gemini-1.5-flash"
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      contents = decoded["contents"]
+      tool_result = Enum.at(contents, 2)
+
+      assert tool_result["parts"] == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "void_tool",
+                   "response" => %{}
+                 }
+               }
+             ]
+    end
+
+    test "encode_body handles complex nested tool result data" do
+      complex_result = %{
+        "status" => "success",
+        "data" => %{
+          "items" => [
+            %{"id" => 1, "name" => "Item 1"},
+            %{"id" => 2, "name" => "Item 2"}
+          ],
+          "metadata" => %{
+            "count" => 2,
+            "timestamp" => "2024-01-01T00:00:00Z"
+          }
+        }
+      }
+
+      context =
+        Context.new([
+          Context.user("Fetch items"),
+          Context.assistant("",
+            tool_calls: [
+              %{id: "call_1", name: "fetch_items", arguments: %{}}
+            ]
+          ),
+          Context.tool_result_message("fetch_items", "call_1", complex_result)
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: "gemini-1.5-flash"
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      contents = decoded["contents"]
+      tool_result = Enum.at(contents, 2)
+
+      assert tool_result["parts"] == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "fetch_items",
+                   "response" => complex_result
+                 }
+               }
+             ]
+    end
+
+    test "full agentic loop: user -> tool call -> tool result -> final response" do
+      # Simulate a complete agentic loop
+      initial_context =
+        Context.new([
+          Context.system("You are a helpful assistant"),
+          Context.user("What's 2+2?")
+        ])
+
+      # First request - LLM calls tool
+      mock_request_1 = %Req.Request{
+        options: [
+          context: initial_context,
+          model: "gemini-1.5-flash",
+          tools: [
+            ReqLLM.Tool.new!(
+              name: "calculate",
+              description: "Perform calculation",
+              parameter_schema: [expr: [type: :string, required: true]],
+              callback: fn _ -> {:ok, "4"} end
+            )
+          ]
+        ]
+      }
+
+      updated_request_1 = Google.encode_body(mock_request_1)
+      decoded_1 = Jason.decode!(updated_request_1.body)
+
+      # Verify tools are sent
+      assert Map.has_key?(decoded_1, "tools")
+
+      assert decoded_1["contents"] == [
+               %{"role" => "user", "parts" => [%{"text" => "What's 2+2?"}]}
+             ]
+
+      # Simulate LLM response with tool call
+      # In real scenario, this would come from Google API
+      # Then we'd build a new context with the tool result
+
+      context_with_tool_result =
+        Context.new([
+          Context.system("You are a helpful assistant"),
+          Context.user("What's 2+2?"),
+          Context.assistant("Let me calculate that.",
+            tool_calls: [
+              %{id: "call_1", name: "calculate", arguments: %{"expr" => "2+2"}}
+            ]
+          ),
+          Context.tool_result_message("calculate", "call_1", "4")
+        ])
+
+      # Second request - Send tool result back
+      mock_request_2 = %Req.Request{
+        options: [
+          context: context_with_tool_result,
+          model: "gemini-1.5-flash",
+          tools: [
+            ReqLLM.Tool.new!(
+              name: "calculate",
+              description: "Perform calculation",
+              parameter_schema: [expr: [type: :string, required: true]],
+              callback: fn _ -> {:ok, "4"} end
+            )
+          ]
+        ]
+      }
+
+      updated_request_2 = Google.encode_body(mock_request_2)
+      decoded_2 = Jason.decode!(updated_request_2.body)
+
+      # Verify the complete conversation is sent
+      # System message should be in systemInstruction, not contents
+      assert Map.has_key?(decoded_2, "systemInstruction")
+
+      contents = decoded_2["contents"]
+      # contents: user, model with tool call, tool result (3 messages)
+      assert length(contents) == 3
+
+      # User question
+      assert Enum.at(contents, 0)["role"] == "user"
+
+      # Assistant with tool call
+      assert Enum.at(contents, 1)["role"] == "model"
+      model_parts = Enum.at(contents, 1)["parts"]
+      assert Enum.any?(model_parts, &Map.has_key?(&1, "functionCall"))
+
+      # Tool result (third message, not fourth - system is separate)
+      assert Enum.at(contents, 2)["role"] == "user"
+
+      assert Enum.at(contents, 2)["parts"] == [
+               %{
+                 "functionResponse" => %{
+                   "name" => "calculate",
+                   "response" => "4"
+                 }
+               }
+             ]
+
+      # This allows the LLM to now provide a final answer
+    end
+  end
+
   describe "error handling & robustness" do
     test "context validation" do
       # Multiple system messages should fail

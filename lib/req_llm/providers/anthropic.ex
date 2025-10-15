@@ -317,8 +317,39 @@ defmodule ReqLLM.Providers.Anthropic do
   end
 
   @impl ReqLLM.Provider
-  def decode_sse_event(event, model) do
-    ReqLLM.Providers.Anthropic.Response.decode_sse_event(event, model)
+  def init_stream_state(_model) do
+    %{tool_calls: %{}}
+  end
+
+  @impl ReqLLM.Provider
+  def decode_sse_event(event, model, provider_state) do
+    ReqLLM.Providers.Anthropic.Response.decode_sse_event_stateful(event, model, provider_state)
+  end
+
+  @impl ReqLLM.Provider
+  def flush_stream_state(_model, provider_state) do
+    # Emit any buffered tool calls that haven't been completed
+    tool_calls =
+      provider_state.tool_calls
+      |> Map.values()
+      |> Enum.map(fn tool_call ->
+        # Parse accumulated JSON if available
+        arguments =
+          if tool_call.json_fragments == [] do
+            %{}
+          else
+            json_str = IO.iodata_to_binary(tool_call.json_fragments)
+
+            case Jason.decode(json_str) do
+              {:ok, args} -> args
+              {:error, _} -> %{}
+            end
+          end
+
+        ReqLLM.StreamChunk.tool_call(tool_call.name, arguments, %{id: tool_call.id})
+      end)
+
+    {tool_calls, provider_state}
   end
 
   @impl ReqLLM.Provider

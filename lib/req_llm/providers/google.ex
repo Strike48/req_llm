@@ -53,6 +53,9 @@ defmodule ReqLLM.Providers.Google do
   import ReqLLM.Provider.Utils,
     only: [maybe_put: 3, ensure_parsed_body: 1]
 
+  alias ReqLLM.Message
+  alias ReqLLM.Message.ContentPart
+
   require Logger
 
   @doc """
@@ -416,12 +419,10 @@ defmodule ReqLLM.Providers.Google do
   defp encode_chat_body(request) do
     {system_instruction, contents} =
       case request.options[:context] do
-        %ReqLLM.Context{} = ctx ->
-          model_name = request.options[:model]
-          # Convert OpenAI-style context to Gemini format
-          encoded = ReqLLM.Provider.Defaults.encode_context_to_openai_format(ctx, model_name)
-          messages = encoded[:messages] || encoded["messages"] || []
-          split_messages_for_gemini(messages)
+        %ReqLLM.Context{messages: messages} = _ctx ->
+          # Process Context messages directly for Google since tool results
+          # need special handling that differs from OpenAI format
+          split_messages_for_gemini_from_context(messages)
 
         _ ->
           split_messages_for_gemini(request.options[:messages] || [])
@@ -966,6 +967,47 @@ defmodule ReqLLM.Providers.Google do
     end
   end
 
+  # Split Context messages (ReqLLM.Message structs) into system instruction and contents for Google Gemini
+  # Handles ContentPart structs directly without OpenAI encoding
+  defp split_messages_for_gemini_from_context(messages) do
+    {system_msgs, chat_msgs} =
+      Enum.split_with(messages, fn
+        %Message{role: :system} -> true
+        _ -> false
+      end)
+
+    system_instruction =
+      case system_msgs do
+        [] ->
+          nil
+
+        system_messages ->
+          combined_text =
+            system_messages
+            |> Enum.map_join("\n\n", fn %Message{content: content} ->
+              case content do
+                text when is_binary(text) ->
+                  text
+
+                parts when is_list(parts) ->
+                  Enum.map_join(parts, "", fn
+                    %ContentPart{type: :text, text: text} -> text
+                    _ -> ""
+                  end)
+
+                _ ->
+                  ""
+              end
+            end)
+
+          %{parts: [%{text: combined_text}]}
+      end
+
+    contents = convert_context_messages_to_gemini(chat_msgs)
+
+    {system_instruction, contents}
+  end
+
   # Split messages into system instruction and contents for Google Gemini
   defp split_messages_for_gemini(messages) do
     {system_msgs, chat_msgs} =
@@ -997,6 +1039,165 @@ defmodule ReqLLM.Providers.Google do
     {system_instruction, contents}
   end
 
+  # Convert ReqLLM.Message structs to Gemini format (handles ContentPart structs directly)
+  defp convert_context_messages_to_gemini(messages) do
+    Enum.map(messages, fn message ->
+      %Message{role: role, content: content, name: name, tool_calls: tool_calls} = message
+
+      # Convert role to Gemini format
+      gemini_role =
+        case role do
+          :user -> "user"
+          :assistant -> "model"
+          :tool -> "user"
+          _ -> "user"
+        end
+
+      # Convert content to parts
+      content_parts =
+        case content do
+          text when is_binary(text) ->
+            if text == "" do
+              []
+            else
+              [%{text: text}]
+            end
+
+          parts when is_list(parts) ->
+            Enum.map(parts, fn part ->
+              convert_content_part_struct(part, name)
+            end)
+
+          _ ->
+            []
+        end
+
+      # Convert tool_calls to Google's functionCall format
+      tool_call_parts =
+        case tool_calls do
+          nil ->
+            []
+
+          calls when is_list(calls) ->
+            Enum.map(calls, fn
+              %ReqLLM.ToolCall{id: _id, function: %{name: name, arguments: args}} ->
+                # args is already a JSON string, decode it
+                parsed_args =
+                  case Jason.decode(args) do
+                    {:ok, decoded} -> decoded
+                    {:error, _} -> %{}
+                  end
+
+                %{functionCall: %{name: name, args: parsed_args}}
+
+              _other ->
+                # Handle other formats if needed
+                nil
+            end)
+            |> Enum.reject(&is_nil/1)
+        end
+
+      # For tool result messages, convert the content to functionResponse
+      tool_result_parts =
+        if role == :tool and name != nil do
+          # Extract the actual result data from content
+          result_data =
+            case content do
+              text when is_binary(text) ->
+                # Only parse JSON if it looks like structured data (starts with { or [)
+                if String.starts_with?(String.trim(text), ["{", "["]) do
+                  case Jason.decode(text) do
+                    {:ok, decoded} -> decoded
+                    {:error, _} -> text
+                  end
+                else
+                  text
+                end
+
+              [%ContentPart{type: :text, text: text}] ->
+                # Only parse JSON if it looks like structured data (starts with { or [)
+                if String.starts_with?(String.trim(text), ["{", "["]) do
+                  case Jason.decode(text) do
+                    {:ok, decoded} -> decoded
+                    {:error, _} -> text
+                  end
+                else
+                  text
+                end
+
+              _ ->
+                ""
+            end
+
+          [
+            %{
+              functionResponse: %{
+                name: name,
+                response: result_data
+              }
+            }
+          ]
+        else
+          []
+        end
+
+      # Combine all parts: content + tool_calls + tool_results
+      # For tool messages, only use tool_result_parts
+      # For assistant messages with tool_calls, use content + tool_calls
+      parts =
+        if role == :tool do
+          tool_result_parts
+        else
+          content_parts ++ tool_call_parts
+        end
+
+      %{role: gemini_role, parts: parts}
+    end)
+  end
+
+  # Convert ContentPart structs to Google format
+  defp convert_content_part_struct(%ReqLLM.Message.ContentPart{type: :text, text: text}, _name) do
+    %{text: text}
+  end
+
+  defp convert_content_part_struct(
+         %ReqLLM.Message.ContentPart{type: :file, data: data, media_type: media_type},
+         _name
+       ) do
+    encoded_data = Base.encode64(data)
+
+    %{
+      inline_data: %{
+        mime_type: media_type,
+        data: encoded_data
+      }
+    }
+  end
+
+  defp convert_content_part_struct(
+         %ReqLLM.Message.ContentPart{type: :image, data: data, media_type: media_type},
+         _name
+       ) do
+    encoded_data = Base.encode64(data)
+
+    %{
+      inline_data: %{
+        mime_type: media_type,
+        data: encoded_data
+      }
+    }
+  end
+
+  defp convert_content_part_struct(%ReqLLM.Message.ContentPart{} = part, _name) do
+    # For unknown ContentPart types, inspect rather than to_string
+    %{text: "[Unsupported content: #{inspect(part.type)}]"}
+  end
+
+  defp convert_content_part_struct(part, _name) do
+    %{text: to_string(part)}
+  end
+
+  # Helper to convert OpenAI-style messages to Gemini format (non-system messages only)
   defp convert_messages_to_gemini(messages) do
     Enum.map(messages, fn message ->
       raw_role =
@@ -1027,10 +1228,18 @@ defmodule ReqLLM.Providers.Google do
           _ -> ""
         end
 
-      content_parts =
+      # Extract tool name for tool result messages
+      tool_name =
+        case message do
+          %{name: name} when is_binary(name) -> name
+          %{"name" => name} when is_binary(name) -> name
+          _ -> nil
+        end
+
+      parts =
         case raw_content do
           content when is_binary(content) -> [%{text: content}]
-          parts when is_list(parts) -> Enum.map(parts, &convert_content_part/1)
+          parts when is_list(parts) -> Enum.map(parts, &convert_content_part(&1, tool_name))
         end
 
       tool_call_parts =
@@ -1071,7 +1280,7 @@ defmodule ReqLLM.Providers.Google do
             []
         end
 
-      parts = content_parts ++ tool_call_parts ++ tool_result_parts
+      parts = parts ++ tool_call_parts ++ tool_result_parts
 
       %{role: role, parts: parts}
     end)
@@ -1144,9 +1353,8 @@ defmodule ReqLLM.Providers.Google do
     end)
   end
 
-  # Handle OpenAI-format image_url (from Provider.Defaults.encode_openai_content_part)
-  defp convert_content_part(%{type: "image_url", image_url: %{url: url}}) when is_binary(url) do
-    # Parse data URI format: data:mime/type;base64,<data>
+  defp convert_content_part(%{type: "image_url", image_url: %{url: url}}, _tool_name)
+       when is_binary(url) do
     case String.split(url, ",", parts: 2) do
       [header, base64_data] ->
         mime_type =
@@ -1163,13 +1371,11 @@ defmodule ReqLLM.Providers.Google do
         }
 
       _ ->
-        # Not a data URI, might be a URL
         %{text: "[Unsupported image URL]"}
     end
   end
 
-  # Most specific patterns first (file, image, etc.) - for ContentPart structs
-  defp convert_content_part(%{type: :file, data: data, media_type: media_type})
+  defp convert_content_part(%{type: :file, data: data, media_type: media_type}, _tool_name)
        when is_binary(data) do
     encoded_data = Base.encode64(data)
 
@@ -1181,19 +1387,109 @@ defmodule ReqLLM.Providers.Google do
     }
   end
 
-  # Specific text patterns
-  defp convert_content_part(%{type: :text, content: text}), do: %{text: text}
-  defp convert_content_part(%{"type" => "text", "text" => text}), do: %{text: text}
+  defp convert_content_part(%{type: :tool_call, tool_name: name, input: input}, _tool_name) do
+    %{
+      functionCall: %{
+        name: name,
+        args: input
+      }
+    }
+  end
 
-  # Generic catch-all patterns (must come after specific patterns)
-  defp convert_content_part(%{text: text}) when is_binary(text), do: %{text: text}
-  defp convert_content_part(%{"text" => text}) when is_binary(text), do: %{text: text}
-  defp convert_content_part(text) when is_binary(text), do: %{text: text}
+  defp convert_content_part(
+         %{
+           "type" => "tool_call",
+           "id" => _id,
+           "function" => %{"name" => name, "arguments" => args}
+         },
+         _tool_name
+       ) do
+    parsed_args =
+      case Jason.decode(args) do
+        {:ok, decoded} -> decoded
+        {:error, _} -> %{}
+      end
 
-  defp convert_content_part(part), do: %{text: to_string(part)}
+    %{
+      functionCall: %{
+        name: name,
+        args: parsed_args
+      }
+    }
+  end
+
+  defp convert_content_part(
+         %{type: "tool_call", id: _id, function: %{name: name, arguments: args}},
+         _tool_name
+       )
+       when is_binary(args) do
+    parsed_args =
+      case Jason.decode(args) do
+        {:ok, decoded} -> decoded
+        {:error, _} -> %{}
+      end
+
+    %{
+      functionCall: %{
+        name: name,
+        args: parsed_args
+      }
+    }
+  end
+
+  defp convert_content_part(
+         %{type: "function", id: _id, function: %{name: name, arguments: args}},
+         _tool_name
+       )
+       when is_binary(args) do
+    parsed_args =
+      case Jason.decode(args) do
+        {:ok, decoded} -> decoded
+        {:error, _} -> %{}
+      end
+
+    %{
+      functionCall: %{
+        name: name,
+        args: parsed_args
+      }
+    }
+  end
+
+  defp convert_content_part(%{type: :tool_result, output: output}, tool_name)
+       when is_binary(tool_name) do
+    %{
+      functionResponse: %{
+        name: tool_name,
+        response: output
+      }
+    }
+  end
+
+  defp convert_content_part(
+         %{"type" => "tool_result", "tool_call_id" => _id, "content" => content},
+         tool_name
+       )
+       when is_binary(tool_name) do
+    %{
+      functionResponse: %{
+        name: tool_name,
+        response: content
+      }
+    }
+  end
+
+  defp convert_content_part(%{type: :text, content: text}, _tool_name), do: %{text: text}
+  defp convert_content_part(%{"type" => "text", "text" => text}, _tool_name), do: %{text: text}
+  defp convert_content_part(%{text: text}, _tool_name) when is_binary(text), do: %{text: text}
+  defp convert_content_part(%{"text" => text}, _tool_name) when is_binary(text), do: %{text: text}
+  defp convert_content_part(text, _tool_name) when is_binary(text), do: %{text: text}
+
+  # Convert tool_call ContentPart to Google's functionCall format
+  defp convert_content_part(part, _tool_name), do: %{text: to_string(part)}
 
   # Decode Google streaming events.
-  # 
+  #
   # Google's :streamGenerateContent endpoint returns JSON array format (not SSE) for 2.5 models.
   # This function handles both formats:
   # - SSE format: %{data: {...}}
@@ -1210,7 +1506,7 @@ defmodule ReqLLM.Providers.Google do
         usage_chunk =
           ReqLLM.StreamChunk.meta(%{
             usage: convert_google_usage_for_streaming(usage),
-            finish_reason: normalize_google_finish_reason(finish_reason),
+            finish_reason: normalize_google_finish_reason(finish_reason) |> String.to_atom(),
             model: model.model,
             terminal?: true
           })
@@ -1225,7 +1521,7 @@ defmodule ReqLLM.Providers.Google do
 
         meta_chunk =
           ReqLLM.StreamChunk.meta(%{
-            finish_reason: normalize_google_finish_reason(finish_reason),
+            finish_reason: normalize_google_finish_reason(finish_reason) |> String.to_atom(),
             terminal?: true
           })
 

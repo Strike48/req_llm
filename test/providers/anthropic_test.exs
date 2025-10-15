@@ -315,6 +315,189 @@ defmodule ReqLLM.Providers.AnthropicTest do
     end
   end
 
+  describe "stateful streaming with tool calls" do
+    test "init_stream_state initializes empty tool call buffer" do
+      model = ReqLLM.Model.from!("anthropic:claude-3-5-sonnet-20241022")
+      state = Anthropic.init_stream_state(model)
+
+      assert state == %{tool_calls: %{}}
+    end
+
+    test "decode_sse_event_stateful buffers tool call until complete" do
+      model = ReqLLM.Model.from!("anthropic:claude-3-5-sonnet-20241022")
+      initial_state = %{tool_calls: %{}}
+
+      # Step 1: content_block_start with tool_use - should buffer, not emit
+      tool_start_event = %{
+        data: %{
+          "type" => "content_block_start",
+          "index" => 0,
+          "content_block" => %{
+            "type" => "tool_use",
+            "id" => "toolu_123",
+            "name" => "get_weather",
+            "input" => %{}
+          }
+        }
+      }
+
+      {chunks1, state1} =
+        ReqLLM.Providers.Anthropic.Response.decode_sse_event_stateful(
+          tool_start_event,
+          model,
+          initial_state
+        )
+
+      # Should not emit any chunks yet
+      assert chunks1 == []
+      # Should buffer the tool call
+      assert Map.has_key?(state1.tool_calls, 0)
+      assert state1.tool_calls[0].name == "get_weather"
+      assert state1.tool_calls[0].id == "toolu_123"
+      assert state1.tool_calls[0].json_fragments == []
+
+      # Step 2: input_json_delta events - should accumulate fragments
+      json_delta1 = %{
+        data: %{
+          "type" => "content_block_delta",
+          "index" => 0,
+          "delta" => %{
+            "type" => "input_json_delta",
+            "partial_json" => "{\"location\":"
+          }
+        }
+      }
+
+      {chunks2, state2} =
+        ReqLLM.Providers.Anthropic.Response.decode_sse_event_stateful(json_delta1, model, state1)
+
+      assert chunks2 == []
+      assert state2.tool_calls[0].json_fragments != []
+
+      json_delta2 = %{
+        data: %{
+          "type" => "content_block_delta",
+          "index" => 0,
+          "delta" => %{
+            "type" => "input_json_delta",
+            "partial_json" => " \"San Francisco, CA\"}"
+          }
+        }
+      }
+
+      {chunks3, state3} =
+        ReqLLM.Providers.Anthropic.Response.decode_sse_event_stateful(json_delta2, model, state2)
+
+      assert chunks3 == []
+
+      # Step 3: content_block_stop - should emit complete tool call
+      stop_event = %{
+        data: %{
+          "type" => "content_block_stop",
+          "index" => 0
+        }
+      }
+
+      {chunks4, state4} =
+        ReqLLM.Providers.Anthropic.Response.decode_sse_event_stateful(stop_event, model, state3)
+
+      # Should emit one complete tool call chunk
+      assert length(chunks4) == 1
+      [tool_call_chunk] = chunks4
+      assert tool_call_chunk.type == :tool_call
+      assert tool_call_chunk.name == "get_weather"
+      assert tool_call_chunk.arguments == %{"location" => "San Francisco, CA"}
+      assert tool_call_chunk.metadata.id == "toolu_123"
+
+      # Should remove from buffer
+      assert state4.tool_calls == %{}
+    end
+
+    test "decode_sse_event_stateful emits text content immediately" do
+      model = ReqLLM.Model.from!("anthropic:claude-3-5-sonnet-20241022")
+      state = %{tool_calls: %{}}
+
+      text_event = %{
+        data: %{
+          "type" => "content_block_delta",
+          "index" => 0,
+          "delta" => %{
+            "type" => "text_delta",
+            "text" => "Hello!"
+          }
+        }
+      }
+
+      {chunks, new_state} =
+        ReqLLM.Providers.Anthropic.Response.decode_sse_event_stateful(text_event, model, state)
+
+      # Text should be emitted immediately, not buffered
+      assert length(chunks) == 1
+      [text_chunk] = chunks
+      assert text_chunk.type == :content
+      assert text_chunk.text == "Hello!"
+      # State should be unchanged
+      assert new_state == state
+    end
+
+    test "flush_stream_state emits buffered incomplete tool calls" do
+      model = ReqLLM.Model.from!("anthropic:claude-3-5-sonnet-20241022")
+
+      # State with a partially completed tool call
+      state = %{
+        tool_calls: %{
+          0 => %{
+            id: "toolu_456",
+            name: "incomplete_tool",
+            index: 0,
+            json_fragments: ["{\"partial\":"]
+          }
+        }
+      }
+
+      {chunks, _new_state} = Anthropic.flush_stream_state(model, state)
+
+      # Should emit the tool call with empty arguments (invalid JSON)
+      assert length(chunks) == 1
+      [tool_call_chunk] = chunks
+      assert tool_call_chunk.type == :tool_call
+      assert tool_call_chunk.name == "incomplete_tool"
+      assert tool_call_chunk.arguments == %{}
+      assert tool_call_chunk.metadata.id == "toolu_456"
+    end
+
+    test "decode_sse_event_stateful normalizes usage metadata" do
+      model = ReqLLM.Model.from!("anthropic:claude-3-5-sonnet-20241022")
+      state = %{tool_calls: %{}}
+
+      # message_delta with usage
+      usage_event = %{
+        data: %{
+          "type" => "message_delta",
+          "delta" => %{"stop_reason" => "tool_use"},
+          "usage" => %{
+            "input_tokens" => 100,
+            "output_tokens" => 50
+          }
+        }
+      }
+
+      {chunks, _new_state} =
+        ReqLLM.Providers.Anthropic.Response.decode_sse_event_stateful(usage_event, model, state)
+
+      # Should emit meta chunks with usage and finish_reason
+      assert length(chunks) == 2
+      [usage_chunk, finish_chunk] = chunks
+
+      assert usage_chunk.type == :meta
+      assert Map.has_key?(usage_chunk.metadata, :usage)
+
+      assert finish_chunk.type == :meta
+      assert finish_chunk.metadata.finish_reason == :tool_calls
+      assert finish_chunk.metadata.terminal? == true
+    end
+  end
+
   # Helper functions for Anthropic-specific fixtures
 
   defp anthropic_format_json_fixture(opts \\ []) do
